@@ -1,3 +1,35 @@
+/**
+ * @brief Serialization markers and custom codecs.
+ * @details
+ * - Build through the MyReflection build hook: it validates markers and registers callbacks at compile time.
+ * - Struct fields are serialized in declaration order by default. @NonSerializeField excludes a field.
+ * - @SerializeFieldsByDefault=false on a struct opts into explicit selection: only fields marked @SerializeField are serialized.
+ *   @SerializeFieldsByDefault=true restores the default behavior. @NonSerializeField takes precedence over @SerializeField.
+ * - @RestrictSerialization on a struct forbids reading/writing it through MySerialize: visiting its value triggers an assertion.
+ * - @CustomSerialize applies to a struct, not a field, and replaces automatic field traversal with the struct's own codec.
+ *   @RestrictSerialization also takes precedence over custom codecs. Field-selection markers do not control callback code.
+ *
+ * A struct T marked @CustomSerialize must declare three methods with these exact signatures:
+ *   get_serialization_size :: (value: T) -> s64;
+ *   serialize :: (destination: BinaryView, value: T) -> s64;
+ *   deserialize :: (source: BinaryView, value: *T) -> s64;
+ * - get_serialization_size returns the payload size only. It may run multiple times; keep the value and consulted external state stable.
+ * - serialize writes directly into the supplied buffer and returns bytes written; it does not need to allocate a new Binary.
+ * - deserialize restores value and returns bytes consumed. Check bounds and copy retained data:
+ *   strings, views and other parts of the result must never reference source. Use make_name() to restore a Name.
+ * - Return -1 on failure. MySerialize asserts on failure or when the returned byte count differs from the payload size.
+ *
+ * MySerialize prefixes the custom payload with its size (u64); callbacks receive a view of the payload only, excluding this prefix.
+ * For nested values, call the module functions: get_serialization_size(field), serialize_into(view, field), deserialize_into(view, *field).
+ * Sum their sizes and advance the view by the returned byte count, checking for failure first.
+ * Nested sizes already include their framing; do not add it manually. Passing the same T value back into these functions causes recursion.
+ * For example, an Asset_Handle codec can serialize a path through these functions and resolve the restored path to a handle when reading.
+ *
+ * Call serialize(value) / deserialize(binary, T) externally, or serialize_into / deserialize_into for existing buffers.
+ * Calling T.serialize / T.deserialize directly handles only the payload, without MySerialize's automatic prefix and checks.
+ * The caller remains responsible for releasing custom resources on failure; see the TODO below.
+ */
+
 // Format: selected fields in declaration order, native scalars, u64 byte lengths and collection element counts.
 // Hash tables store key/value pairs in iteration order; hashes, capacity and tombstones are rebuilt on read.
 // Composite values have a u64 payload-byte-length prefix, excluding the prefix itself.
