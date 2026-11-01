@@ -28,29 +28,41 @@ visit_hash_table :: (state: *Serialize_State, table: Reflection.Table_Adapter, d
     if state.mode == .Validate {
         memcpy(*length, state.bytes.data + state.offset - size_of(u64), size_of(u64));
     }
-    if length > cast(u64)(MAX_ARRAY_ELEMENTS - state.array_elements) {
-        return serialize_error("Total collection element limit exceeded.", state);
+    // The encoded count is u64; the runtime table count is s64.
+    if length > cast(u64)S64_MAX {
+        return serialize_error("Hash-table count exceeds s64 capacity.", state);
     }
     count := cast(s64)length;
-    state.array_elements += count;
+    index_bytes: s64;
     if reading && count > 0 {
         if table.load_factor <= 0 || table.load_factor >= 100 || table.entry_size <= 0 {
             return serialize_error("Unsupported hash-table storage configuration.", state);
         }
+        if count > (S64_MAX - 99) / 100 - 1 {
+            return serialize_error("Hash-table capacity overflow.", state);
+        }
         slots := max(table.minimum_slots, ((count + 1) * 100 + 99) / table.load_factor);
         capacity: s64 = 1;
         while capacity < slots {
+            if capacity > S64_MAX / 2 {
+                return serialize_error("Hash-table capacity overflow.", state);
+            }
             capacity *= 2;
         }
-        // Account for both staging entries and the final index, including load-factor slack.
-        entries := count + capacity;
-        if table.entry_size > (MAX_ARRAY_STORAGE - state.array_storage) / entries {
-            return serialize_error("Collection allocation budget exceeded.", state);
+        if capacity > S64_MAX / table.entry_size || capacity > S64_MAX / table.load_factor {
+            return serialize_error("Hash-table storage size overflow.", state);
         }
-        state.array_storage += entries * table.entry_size;
+        index_bytes = capacity * table.entry_size;
     }
-    if state.mode == .Read && !prepare_table_entries(table, data, count) {
-        return serialize_allocation_error("MySerialize: could not allocate hash-table entries.");
+    if state.mode == .Read {
+        staging_bytes := count * table.entry_size;
+        if !can_allocate_deserialized(state.read_context, staging_bytes) {
+            return false;
+        }
+        if !prepare_table_entries(table, data, count) {
+            return serialize_allocation_error("MySerialize: could not allocate hash-table entries.");
+        }
+        state.read_context.allocated_bytes += staging_bytes;
     }
     cursor: s64;
     for index: 0..count - 1 {
@@ -72,7 +84,10 @@ visit_hash_table :: (state: *Serialize_State, table: Reflection.Table_Adapter, d
         }
     }
     if state.mode == .Read {
-        complete, duplicate := finish_table_entries(table, data);
+        if !can_allocate_deserialized(state.read_context, index_bytes) {
+            return false;
+        }
+        complete, duplicate := finish_table_entries(table, data, state.read_context, index_bytes);
         if !complete && duplicate < 0 {
             return serialize_allocation_error("MySerialize: could not allocate the hash-table index.");
         }
@@ -97,14 +112,7 @@ prepare_table_entries :: (table: Reflection.Table_Adapter, data: *u8, count: s64
     }
 
     storage := table.access(data);
-    if storage.allocator.proc == null {
-        if context.allocator.proc != null {
-            storage.allocator.* = context.allocator;
-        }
-        else {
-            storage.allocator.* = context.default_allocator;
-        }
-    }
+    storage.allocator.* = context.allocator;
 
     bytes := count * table.entry_size;
     entries := cast(*u8)alloc(bytes,, storage.allocator.*);
@@ -128,7 +136,7 @@ prepare_table_entries :: (table: Reflection.Table_Adapter, data: *u8, count: s64
     return true;
 }
 
-finish_table_entries :: (table: Reflection.Table_Adapter, data: *u8) -> bool, s64 {
+finish_table_entries :: (table: Reflection.Table_Adapter, data: *u8, settings: *Deserialize_Context, index_bytes: s64) -> bool, s64 {
     storage := table.access(data);
     count := storage.count.*;
     if count == 0 {
@@ -153,6 +161,7 @@ finish_table_entries :: (table: Reflection.Table_Adapter, data: *u8) -> bool, s6
     if !table.try_reserve_empty(data, count) {
         return false, -1;
     }
+    settings.allocated_bytes += index_bytes;
 
     for index: 0..count - 1 {
         entry := staging.data + index * table.entry_size;

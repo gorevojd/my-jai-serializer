@@ -13,6 +13,7 @@
  *   get_serialization_size :: (value: T) -> s64;
  *   serialize :: (destination: BinaryView, value: T) -> s64;
  *   deserialize :: (source: BinaryView, value: *T) -> s64;
+ *
  * - get_serialization_size returns the payload size only. It may run multiple times; keep the value and consulted external state stable.
  * - serialize writes directly into the supplied buffer and returns bytes written; it does not need to allocate a new Binary.
  * - deserialize restores value and returns bytes consumed. Check bounds and copy retained data:
@@ -53,6 +54,30 @@
 #load "serialize_union.jai";
 #load "serialize_array.jai";
 #load "serialize_hash_table.jai";
+
+/**
+ * @brief Allocation policy and statistics for one deserialization operation.
+ * @details
+ * - An empty allocator selects the current Jai allocator. Its backing storage must outlive the decoded result.
+ * - allocation_limit is a cumulative requested-byte budget; zero means unlimited. Allocator overhead is not counted.
+ * - allocated_bytes resets at the outer call and counts successful allocations, including freed table staging storage.
+ * - Nested MySerialize reads in custom callbacks inherit the active operation when no context argument is supplied.
+ * - Name interning uses process-owned storage outside this budget. Direct allocations in custom codecs are also outside it.
+ * - The context itself is borrowed only during the call. Do not share it concurrently or modify it from callbacks.
+ * - Storage is allocated on demand; no memory-size prepass or internal arena is created.
+ *
+ * Example:
+ *   reading: Deserialize_Context;
+ *   reading.allocator = context.allocator;
+ *   reading.allocation_limit = 100 * 1024 * 1024;
+ *   value, ok := deserialize(binary, My_Type, *reading);
+ * Free strings and views with the selected allocator. Binary, resizable arrays and tables remember it themselves.
+ */
+Deserialize_Context :: struct {
+    allocator: Allocator;
+    allocation_limit: s64;
+    allocated_bytes: s64;
+}
 
 /**
  * @brief Computes the encoded size without allocating output or invoking custom serialize methods.
@@ -109,19 +134,20 @@ serialize_into :: (destination: BinaryView, value: $T) -> s64 {
  * @brief Reads an entire binary into a value initialized with its declared defaults.
  * @param[in] binary Input storage; decoded results must never retain its bytes.
  * @param[in] T Result type.
+ * @param[in,out] read_context Allocation policy and statistics; null inherits the active operation or uses default policy.
  * @return Value and success flag. Custom-codec failure may leave a partially decoded value requiring cleanup.
  * @details
  * - Strings and BinaryViews own copies: free their data in the decoding allocator context.
  * - Binary fields own copies released with clear_binary. Names are interned and must not be freed.
  * - Arrays own independent element storage. Release nested resources before freeing the array itself.
  * - Tables own their entries and decoded keys/values. Release nested resources before deinit.
- * - Array/table decoding shares a limit of 1,048,576 elements and 256 MiB of collection storage per call.
+ * - Pass a Deserialize_Context to select the allocator and optional byte budget; no fixed element-count limit is imposed.
  * - Table keys must preserve equality/hash semantics across serialization. Duplicate decoded keys are rejected.
  * - On failure, tables may contain staging entries: only iterate for resource cleanup and deinit; do not perform lookups or inserts.
  */
-deserialize :: (binary: Binary, $T: Type) -> T, bool {
+deserialize :: (binary: Binary, $T: Type, read_context: *Deserialize_Context = null) -> T, bool {
     value: T;
-    count := deserialize_into(binary, *value);
+    count := deserialize_into(binary, *value, read_context);
     return value, count >= 0;
 }
 
@@ -129,22 +155,23 @@ deserialize :: (binary: Binary, $T: Type) -> T, bool {
  * @brief Reads one value from the beginning of a view after checking its structural bounds.
  * @param[in] source Input view, borrowed only for this call and never retained by decoded results.
  * @param[in,out] value Destination; unselected fields remain unchanged.
+ * @param[in,out] read_context Allocation policy and statistics; null inherits the active operation or uses default policy.
  * @return Bytes consumed, or -1 after an assertion on failure. Trailing bytes may belong to the next value.
  * @pre Release resources of an existing tagged-union variant before replacing it.
  * @pre Dynamic array destinations must have zero count and null data (no reserved storage).
- * @pre Hash-table destinations must be empty with no reserved storage; their allocator may be configured.
+ * @pre Hash-table destinations must be empty with no reserved storage; the operation selects their allocator.
  * @note On a custom-codec failure, allocated arrays remain attached to the partial result for caller cleanup.
  * @pre Input must not overlap the destination or its owned allocations. Binary fields must be valid or empty.
  * @note Release previously owned strings/views before replacement; their prior storage may be borrowed or literal.
  * @note Custom codecs must check bounds before access and copy retained data. Their failure may leave earlier fields updated.
  */
-deserialize_into :: (source: BinaryView, value: *$T) -> s64 {
-    return read_value(source, type_info(T), cast(*u8)value, false);
+deserialize_into :: (source: BinaryView, value: *$T, read_context: *Deserialize_Context = null) -> s64 {
+    return read_value(source, type_info(T), cast(*u8)value, false, read_context);
 }
 
 // An owning Binary represents one complete message; reject trailing bytes before updating the destination.
-deserialize_into :: (binary: Binary, value: *$T) -> s64 {
-    return read_value(make_binary_view(binary), type_info(T), cast(*u8)value, true);
+deserialize_into :: (binary: Binary, value: *$T, read_context: *Deserialize_Context = null) -> s64 {
+    return read_value(make_binary_view(binary), type_info(T), cast(*u8)value, true, read_context);
 }
 
 #scope_module
@@ -170,18 +197,35 @@ Serialize_State :: struct {
     mode: Serialize_Mode;
     bytes: BinaryView;
     offset: s64;
-    array_elements: s64;
-    array_storage: s64;
+    read_context: *Deserialize_Context;
     path_count: int;
     path: [MAX_SERIALIZE_DEPTH + 1]Serialization_Path;
 }
 
 MAX_SERIALIZE_DEPTH :: 128;
-MAX_SERIALIZE_SIZE :: 0x7fffffffffffffff;
-MAX_ARRAY_ELEMENTS :: 1048576;
-MAX_ARRAY_STORAGE :: 256 * 1024 * 1024;
+S64_MAX :s64: 0x7fff_ffff_ffff_ffff;
+Deserialize_Operation :: struct {
+    settings: *Deserialize_Context;
+    allocator: Allocator;
+    depth: int;
+    allocation_failed: bool;
+}
+#add_context myserialize_read_operation: *Deserialize_Operation;
+
+can_allocate_deserialized :: (settings: *Deserialize_Context, bytes: s64) -> bool {
+    if (bytes < 0 ||
+        bytes > S64_MAX - settings.allocated_bytes ||
+        (settings.allocation_limit > 0 && bytes > settings.allocation_limit - settings.allocated_bytes))
+    {
+        return serialize_allocation_error("MySerialize: deserialization allocation_limit exceeded or allocation size overflowed.");
+    }
+    return true;
+}
 
 serialize_allocation_error :: (message: string, location := #caller_location) -> bool {
+    if context.myserialize_read_operation != null {
+        context.myserialize_read_operation.allocation_failed = true;
+    }
     // Avoid String_Builder and assert_helper's temporary formatting while reporting allocation failure.
     #if Assertions.ENABLE_ASSERT {
         if !context.handling_assertion_failure {
@@ -220,7 +264,7 @@ serialize_error :: (message: string, state: *Serialize_State = null) -> bool {
 }
 
 transfer_bytes :: (state: *Serialize_State, data: *u8, count: s64) -> bool {
-    if count < 0 || count > MAX_SERIALIZE_SIZE - state.offset {
+    if count < 0 || count > S64_MAX - state.offset {
         return serialize_error("Serialized size overflow.", state);
     }
     if state.mode != .Measure && count > state.bytes.count - state.offset {
@@ -266,7 +310,41 @@ write_value :: (destination: BinaryView, info: *Type_Info, data: *u8, expected: 
     return state.offset;
 }
 
-read_value :: (source: BinaryView, info: *Type_Info, data: *u8, require_complete: bool) -> s64 {
+read_value :: (source: BinaryView, info: *Type_Info, data: *u8, require_complete: bool, requested: *Deserialize_Context) -> s64 {
+    local_settings: Deserialize_Context;
+    settings := requested;
+    active := context.myserialize_read_operation;
+    if active != null {
+        if settings != null && settings != active.settings {
+            serialize_error("Nested reads must share the active Deserialize_Context.");
+            return -1;
+        }
+        settings = active.settings;
+    }
+    else if settings == null {
+        settings = *local_settings;
+    }
+    operation: Deserialize_Operation;
+    if active == null {
+        settings.allocated_bytes = 0;
+        if settings.allocation_limit < 0 {
+            serialize_allocation_error("MySerialize: allocation_limit must be nonnegative.");
+            return -1;
+        }
+        operation.settings = settings;
+        operation.allocator = settings.allocator;
+        if operation.allocator.proc == null {
+            operation.allocator = ifx context.allocator.proc != null then context.allocator else context.default_allocator;
+        }
+        active = *operation;
+    }
+    previous_operation := context.myserialize_read_operation;
+    context.myserialize_read_operation = active;
+    defer context.myserialize_read_operation = previous_operation;
+    push_allocator(active.allocator);
+    if active.allocation_failed {
+        return -1;
+    }
     if data == null {
         serialize_error("Null deserialization destination.");
         return -1;
@@ -277,7 +355,8 @@ read_value :: (source: BinaryView, info: *Type_Info, data: *u8, require_complete
     state: Serialize_State;
     state.mode = .Validate;
     state.bytes = source;
-    if !visit_value(*state, info, data, 0) {
+    state.read_context = settings;
+    if !visit_value(*state, info, data, active.depth) {
         return -1;
     }
     expected := state.offset;
@@ -287,9 +366,7 @@ read_value :: (source: BinaryView, info: *Type_Info, data: *u8, require_complete
     }
     state.mode = .Read;
     state.offset = 0;
-    state.array_elements = 0;
-    state.array_storage = 0;
-    if !visit_value(*state, info, data, 0) {
+    if !visit_value(*state, info, data, active.depth) {
         return -1;
     }
     if state.offset != expected {

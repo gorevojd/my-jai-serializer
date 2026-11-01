@@ -38,7 +38,7 @@ visit_blob :: (state: *Serialize_State, info: *Type_Info, data: *u8) -> bool {
         memcpy(*length, state.bytes.data + state.offset - size_of(u64), size_of(u64));
     }
 
-    if length > MAX_SERIALIZE_SIZE {
+    if length > cast(u64)S64_MAX {
         return serialize_error("Serialized byte length exceeds s64 capacity.", state);
     }
 
@@ -53,6 +53,9 @@ visit_blob :: (state: *Serialize_State, info: *Type_Info, data: *u8) -> bool {
         }
 
         if state.mode == .Read {
+            if info != type_info(Name) && !can_allocate_deserialized(state.read_context, count) {
+                return false;
+            }
             if info == type_info(string) || info == type_info(Name) {
                 text: string;
                 text.data = bytes.data;
@@ -89,6 +92,9 @@ visit_blob :: (state: *Serialize_State, info: *Type_Info, data: *u8) -> bool {
             }
             else {
                 return serialize_error("Unsupported blob destination.", state);
+            }
+            if info != type_info(Name) {
+                state.read_context.allocated_bytes += count;
             }
         }
         state.offset += count;
@@ -141,7 +147,7 @@ visit_value_body :: (state: *Serialize_State, info: *Type_Info, data: *u8, depth
             return serialize_error(tprint("Type '%' has @RestrictSerialization.", metadata.name), state);
         }
         if metadata.custom_serialization {
-            return visit_custom(state, metadata, data);
+            return visit_custom(state, metadata, data, depth);
         }
         if metadata.is_hash_table {
             return visit_hash_table(state, metadata.table_adapter, data, depth);
@@ -173,7 +179,7 @@ visit_value_body :: (state: *Serialize_State, info: *Type_Info, data: *u8, depth
     return serialize_error("Unsupported type: raw pointers, procedures and external resources require a codec.", state);
 }
 
-visit_custom :: (state: *Serialize_State, metadata: *Reflection.Struct_Metadata, data: *u8) -> bool {
+visit_custom :: (state: *Serialize_State, metadata: *Reflection.Struct_Metadata, data: *u8, depth: int) -> bool {
     if (metadata.custom_size == null ||
         metadata.custom_serialize == null ||
         metadata.custom_deserialize == null) {
@@ -194,7 +200,7 @@ visit_custom :: (state: *Serialize_State, metadata: *Reflection.Struct_Metadata,
     if state.mode == .Validate {
         memcpy(*length, state.bytes.data + state.offset - size_of(u64), size_of(u64));
     }
-    if length > cast(u64)(MAX_SERIALIZE_SIZE - state.offset) {
+    if length > cast(u64)(S64_MAX - state.offset) {
         return serialize_error("Custom payload size overflow.", state);
     }
     size := cast(s64)length;
@@ -208,7 +214,14 @@ visit_custom :: (state: *Serialize_State, metadata: *Reflection.Struct_Metadata,
             count = metadata.custom_serialize(payload, data);
         }
         else if state.mode == .Read {
+            operation := context.myserialize_read_operation;
+            previous_depth := operation.depth;
+            operation.depth = depth + 1;
+            defer operation.depth = previous_depth;
             count = metadata.custom_deserialize(payload, data);
+            if operation.allocation_failed {
+                return false;
+            }
         }
         if count < 0 || count != size {
             return serialize_error("Custom codec returned a byte count different from its payload size.", state);

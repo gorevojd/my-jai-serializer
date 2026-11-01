@@ -38,13 +38,13 @@ visit_array :: (state: *Serialize_State, info: *Type_Info_Array, data: *u8, dept
     if reading && fixed && length != cast(u64)info.array_count {
         return serialize_error("Fixed array element count does not match its type.", state);
     }
-    if length > cast(u64)(MAX_ARRAY_ELEMENTS - state.array_elements) {
-        return serialize_error("Total array element limit exceeded.", state);
+    // The encoded count is u64; the runtime array count is s64.
+    if length > cast(u64)S64_MAX {
+        return serialize_error("Array element count exceeds s64 capacity.", state);
     }
     count = cast(s64)length;
-    state.array_elements += count;
     stride := info.element_type.runtime_size;
-    if stride < 0 || (stride > 0 && count > MAX_SERIALIZE_SIZE / stride) {
+    if stride < 0 || (stride > 0 && count > S64_MAX / stride) {
         return serialize_error("Array storage size overflow.", state);
     }
     byte_count := count * stride;
@@ -67,12 +67,6 @@ visit_array :: (state: *Serialize_State, info: *Type_Info_Array, data: *u8, dept
             return serialize_error("Numeric array payload exceeds its block.", state);
         }
     }
-    if reading && !fixed {
-        if byte_count > MAX_ARRAY_STORAGE - state.array_storage {
-            return serialize_error("Array allocation budget exceeded.", state);
-        }
-        state.array_storage += byte_count;
-    }
     if state.mode == .Read {
         if fixed {
             elements = data;
@@ -80,10 +74,15 @@ visit_array :: (state: *Serialize_State, info: *Type_Info_Array, data: *u8, dept
         else {
             if count > 0 {
                 // Zero-size element types still need a usable storage pointer for callbacks.
-                elements = cast(*u8)alloc(ifx byte_count > 0 then byte_count else 1);
+                allocation_size := ifx byte_count > 0 then byte_count else 1;
+                if !can_allocate_deserialized(state.read_context, allocation_size) {
+                    return false;
+                }
+                elements = cast(*u8)alloc(allocation_size);
                 if elements == null {
                     return serialize_allocation_error("MySerialize: could not allocate array storage.");
                 }
+                state.read_context.allocated_bytes += allocation_size;
                 if !numeric {
                     if byte_count > 0 {
                         memset(elements, 0, byte_count);
