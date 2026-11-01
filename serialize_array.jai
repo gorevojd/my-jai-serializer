@@ -48,6 +48,25 @@ visit_array :: (state: *Serialize_State, info: *Type_Info_Array, data: *u8, dept
         return serialize_error("Array storage size overflow.", state);
     }
     byte_count := count * stride;
+    numeric := info.element_type.type == .INTEGER || info.element_type.type == .FLOAT;
+    if numeric {
+        if count > 0 {
+            if state.path_count >= state.path.count {
+                return serialize_error("Serialization path depth exceeded.", state);
+            }
+            if depth >= MAX_SERIALIZE_DEPTH {
+                path := *state.path[state.path_count];
+                path.kind = .Element;
+                path.index = 0;
+                state.path_count += 1;
+                defer state.path_count -= 1;
+                return serialize_error("Serialization nesting limit exceeded.", state);
+            }
+        }
+        if state.mode != .Measure && byte_count > state.bytes.count - state.offset {
+            return serialize_error("Numeric array payload exceeds its block.", state);
+        }
+    }
     if reading && !fixed {
         if byte_count > MAX_ARRAY_STORAGE - state.array_storage {
             return serialize_error("Array allocation budget exceeded.", state);
@@ -65,11 +84,13 @@ visit_array :: (state: *Serialize_State, info: *Type_Info_Array, data: *u8, dept
                 if elements == null {
                     return serialize_allocation_error("MySerialize: could not allocate array storage.");
                 }
-                if byte_count > 0 {
-                    memset(elements, 0, byte_count);
-                }
-                for index: 0..count - 1 {
-                    initialize_array_element(info.element_type, elements + index * stride);
+                if !numeric {
+                    if byte_count > 0 {
+                        memset(elements, 0, byte_count);
+                    }
+                    for index: 0..count - 1 {
+                        initialize_array_element(info.element_type, elements + index * stride);
+                    }
                 }
             }
             view := cast(*Array_View_64)data;
@@ -84,6 +105,10 @@ visit_array :: (state: *Serialize_State, info: *Type_Info_Array, data: *u8, dept
     }
     else if state.mode == .Validate && fixed {
         elements = data;
+    }
+    if numeric {
+        // Scalar encoding is already native bytes. Keep framing and count checks, then transfer the contiguous payload once.
+        return transfer_bytes(state, elements, byte_count);
     }
     for index: 0..count - 1 {
         element := ifx elements != null then elements + index * stride else null;
