@@ -119,6 +119,12 @@ visit_value_body :: (state: *Serialize_State, info: *Type_Info, data: *u8, depth
     if info.type == .ARRAY {
         return visit_array(state, cast(*Type_Info_Array)info, data, depth);
     }
+    if info.type == .TYPE {
+        return visit_type(state, data);
+    }
+    if info.type == .ENUM {
+        return visit_enum(state, cast(*Type_Info_Enum)info, data);
+    }
 
     if info.type == .BOOL {
         if state.mode == .Validate || state.mode == .Read {
@@ -134,7 +140,7 @@ visit_value_body :: (state: *Serialize_State, info: *Type_Info, data: *u8, depth
         return transfer_bytes(state, data, 1);
     }
 
-    if info.type == .INTEGER || info.type == .FLOAT || info.type == .ENUM {
+    if info.type == .INTEGER || info.type == .FLOAT {
         return transfer_bytes(state, data, info.runtime_size);
     }
 
@@ -145,6 +151,12 @@ visit_value_body :: (state: *Serialize_State, info: *Type_Info, data: *u8, depth
         }
         if metadata.restrict_serialization {
             return serialize_error(tprint("Type '%' has @RestrictSerialization.", metadata.name), state);
+        }
+        if (state.mode == .Measure &&
+            metadata.serialized_payload_size >= 0 &&
+            metadata.serialized_depth <= MAX_SERIALIZE_DEPTH - depth)
+        {
+            return transfer_bytes(state, null, metadata.serialized_payload_size);
         }
         if metadata.custom_serialization {
             return visit_custom(state, metadata, data, depth);

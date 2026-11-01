@@ -109,6 +109,19 @@ visit_array :: (state: *Serialize_State, info: *Type_Info_Array, data: *u8, dept
         // Scalar encoding is already native bytes. Keep framing and count checks, then transfer the contiguous payload once.
         return transfer_bytes(state, elements, byte_count);
     }
+    if state.mode == .Measure && info.element_type.type == .STRUCT {
+        metadata := Reflection.find_struct(info.element_type);
+        if (metadata != null &&
+            metadata.serialized_size >= 0 &&
+            (count == 0 || metadata.serialized_depth < MAX_SERIALIZE_DEPTH - depth))
+        {
+            size := metadata.serialized_size;
+            if size > 0 && count > (S64_MAX - state.offset) / size {
+                return serialize_error("Serialized array size overflow.", state);
+            }
+            return transfer_bytes(state, null, count * size);
+        }
+    }
     for index: 0..count - 1 {
         element := ifx elements != null then elements + index * stride else null;
         if state.path_count >= state.path.count {

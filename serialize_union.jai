@@ -11,7 +11,7 @@ visit_tagged_union :: (state: *Serialize_State,
     }
     tag := info.members[0];
     if tag.type.type != .INTEGER && tag.type.type != .ENUM {
-        return serialize_error("Tagged union requires an integer or enum tag; Type tags need a persistent type registry.", state);
+        return serialize_error("Tagged union requires an integer or enum tag; Type-tagged union dispatch is unsupported.", state);
     }
     width := tag.type.runtime_size;
     if width != 1 && width != 2 && width != 4 && width != 8 {
@@ -49,6 +49,17 @@ visit_tagged_union :: (state: *Serialize_State,
         }
     }
     if member_index <= 0 || member_index >= info.members.count {
+        if tag.type.type == .ENUM {
+            if state.mode == .Validate {
+                // There is no active payload schema to validate. Read will report the bad tag and apply its fallback.
+                state.offset = state.bytes.count;
+                return true;
+            }
+            if state.mode == .Read {
+                memset(data + tag.offset_in_bytes, 0, width);
+                return serialize_error("Unknown tagged-union enum tag; destination tag set to 0.", state);
+            }
+        }
         return serialize_error("Unknown tagged-union tag.", state);
     }
     member := info.members[member_index];

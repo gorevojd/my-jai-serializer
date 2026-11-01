@@ -8,6 +8,13 @@
  * - @RestrictSerialization on a struct forbids reading/writing it through MySerialize: visiting its value triggers an assertion.
  * - @CustomSerialize applies to a struct, not a field, and replaces automatic field traversal with the struct's own codec.
  *   @RestrictSerialization also takes precedence over custom codecs. Field-selection markers do not control callback code.
+ * - @Register / @Register="stable_name" registers a struct's Type identity in MyReflection. Names must be unique.
+ *   Selected Type fields encode that name as [u64 byte length][name bytes]; unknown or unregistered types are rejected.
+ *   Registration does not enable excluded fields or permit serializing restricted object data.
+ *   A registered restricted type can still be referenced by a Type field; only its identity is encoded.
+ * - Enum reads require a declared value; enum_flags allow combinations of declared bits, including zero.
+ *   Invalid values assert, set the destination to 0 and fail the read, even if 0 is not a declared enum member.
+ *   An unknown enum tag in a tagged union likewise becomes 0; its payload is not decoded.
  *
  * A struct T marked @CustomSerialize must declare three methods with these exact signatures:
  *   get_serialization_size :: (value: T) -> s64;
@@ -36,6 +43,9 @@
 // Composite values have a u64 payload-byte-length prefix, excluding the prefix itself.
 // This format is incompatible with the older unframed struct/array format.
 // No padding, field names, schema version or endian conversion is stored.
+// Fixed struct payload/encoded sizes are baked in MyReflection; variable/custom/unsupported sizes are -1.
+// A struct frame is [u64 payload bytes][selected fields]. An array frame is [u64 payload bytes][u64 count][elements].
+// The prefix excludes itself. Nested value prefixes remain part of the enclosing payload size.
 // Exclude external resource handles with @NonSerializeField: integer handles cannot be distinguished from ordinary numbers.
 //
 // TODO: Define a cleanup contract for custom deserialized values before making table reads transactional.
@@ -54,6 +64,8 @@
 #load "serialize_union.jai";
 #load "serialize_array.jai";
 #load "serialize_hash_table.jai";
+#load "serialize_enum.jai";
+#load "serialize_type.jai";
 
 /**
  * @brief Allocation policy and statistics for one deserialization operation.
