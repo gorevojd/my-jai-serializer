@@ -58,19 +58,33 @@ visit_blob :: (state: *Serialize_State, info: *Type_Info, data: *u8) -> bool {
                 text.data = bytes.data;
                 text.count = bytes.count;
                 if info == type_info(Name) {
-                    (cast(*Name)data).* = make_name(text);
+                    replacement, interned := try_make_name(text);
+                    if !interned {
+                        return serialize_allocation_error("MySerialize: could not allocate interned Name storage.");
+                    }
+                    (cast(*Name)data).* = replacement;
                 }
                 else if info == type_info(string) {
-                    (cast(*string)data).* = copy_string(text);
+                    replacement, allocated := try_copy_string(text);
+                    if !allocated {
+                        return serialize_allocation_error("MySerialize: could not allocate string storage.");
+                    }
+                    (cast(*string)data).* = replacement;
                 }
             }
             else if info == type_info(Binary) {
-                replacement := deep_copy_binary(bytes.data, bytes.count);
+                replacement, allocated := try_deep_copy_binary(bytes.data, bytes.count);
+                if !allocated {
+                    return serialize_allocation_error("MySerialize: could not allocate Binary storage.");
+                }
                 clear_binary(cast(*Binary)data);
                 (cast(*Binary)data).* = replacement;
             }
             else if info == type_info(BinaryView) {
-                owned := deep_copy_binary(bytes.data, bytes.count);
+                owned, allocated := try_deep_copy_binary(bytes.data, bytes.count);
+                if !allocated {
+                    return serialize_allocation_error("MySerialize: could not allocate BinaryView storage.");
+                }
                 (cast(*BinaryView)data).* = make_binary_view(owned);
             }
             else {

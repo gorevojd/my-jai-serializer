@@ -42,6 +42,9 @@
 // For now, failed table reads retain staging entries in the destination so callers can clean up partial keys/values.
 // Such a table supports cleanup iteration and deinit only: its hash index may be unfinished, so do not look up or insert keys.
 // The caller must handle partially decoded custom values and release their resources; automatic rollback is not provided.
+// Built-in allocation failures assert without allocating diagnostic text, then return false/-1 if the handler continues.
+// Checked allocations preserve the current destination field and leave earlier partial results available for caller cleanup.
+// Custom codecs and assertion handlers remain responsible for their own allocation-failure behavior.
 
 #import "MyBasic";
 
@@ -76,7 +79,11 @@ serialize :: (value: $T) -> Binary, bool {
     if size < 0 {
         return .{}, false;
     }
-    output := make_binary(size);
+    output, allocated := try_make_binary(size);
+    if !allocated {
+        serialize_allocation_error("MySerialize: could not allocate the output Binary.");
+        return .{}, false;
+    }
     if write_value(make_binary_view(output), type_info(T), cast(*u8)*value, size) < 0 {
         clear_binary(*output);
         return .{}, false;
@@ -143,6 +150,7 @@ deserialize_into :: (binary: Binary, value: *$T) -> s64 {
 #scope_module
 #import "Basic";
 Reflection :: #import "MyReflection";
+Assertions :: #import "Basic";
 
 Serialize_Mode :: enum {
     Measure;
@@ -172,6 +180,21 @@ MAX_SERIALIZE_DEPTH :: 128;
 MAX_SERIALIZE_SIZE :: 0x7fffffffffffffff;
 MAX_ARRAY_ELEMENTS :: 1048576;
 MAX_ARRAY_STORAGE :: 256 * 1024 * 1024;
+
+serialize_allocation_error :: (message: string, location := #caller_location) -> bool {
+    // Avoid String_Builder and assert_helper's temporary formatting while reporting allocation failure.
+    #if Assertions.ENABLE_ASSERT {
+        if !context.handling_assertion_failure {
+            context.handling_assertion_failure = true;
+            should_break := context.assertion_failed(location, message);
+            context.handling_assertion_failure = false;
+            if should_break {
+                debug_break();
+            }
+        }
+    }
+    return false;
+}
 
 serialize_error :: (message: string, state: *Serialize_State = null) -> bool {
     if state != null {

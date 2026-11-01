@@ -3,7 +3,7 @@
 visit_hash_table :: (state: *Serialize_State, table: Reflection.Table_Adapter, data: *u8, depth: int) -> bool {
     if (table.count == null ||
         table.access == null ||
-        table.reserve == null ||
+        table.try_reserve_empty == null ||
         table.find == null ||
         table.insert == null ||
         table.reset == null)
@@ -50,7 +50,7 @@ visit_hash_table :: (state: *Serialize_State, table: Reflection.Table_Adapter, d
         state.array_storage += entries * table.entry_size;
     }
     if state.mode == .Read && !prepare_table_entries(table, data, count) {
-        return serialize_error("Could not allocate hash-table entries.", state);
+        return serialize_allocation_error("MySerialize: could not allocate hash-table entries.");
     }
     cursor: s64;
     for index: 0..count - 1 {
@@ -72,7 +72,10 @@ visit_hash_table :: (state: *Serialize_State, table: Reflection.Table_Adapter, d
         }
     }
     if state.mode == .Read {
-        duplicate := finish_table_entries(table, data);
+        complete, duplicate := finish_table_entries(table, data);
+        if !complete && duplicate < 0 {
+            return serialize_allocation_error("MySerialize: could not allocate the hash-table index.");
+        }
         if duplicate >= 0 {
             if state.path_count < state.path.count {
                 path := *state.path[state.path_count];
@@ -92,6 +95,7 @@ prepare_table_entries :: (table: Reflection.Table_Adapter, data: *u8, count: s64
     if count == 0 {
         return true;
     }
+
     storage := table.access(data);
     if storage.allocator.proc == null {
         if context.allocator.proc != null {
@@ -101,17 +105,20 @@ prepare_table_entries :: (table: Reflection.Table_Adapter, data: *u8, count: s64
             storage.allocator.* = context.default_allocator;
         }
     }
+
     bytes := count * table.entry_size;
     entries := cast(*u8)alloc(bytes,, storage.allocator.*);
     if entries == null {
         return false;
     }
+
     memset(entries, 0, bytes);
     storage.entries.data = entries;
     storage.entries.count = count;
     storage.count.* = count;
     storage.allocated.* = count;
     storage.slots_filled.* = count;
+    
     // Preserve access to partial keys/values for caller cleanup if decoding fails.
     for index: 0..count - 1 {
         entry := entries + index * table.entry_size;
@@ -121,34 +128,45 @@ prepare_table_entries :: (table: Reflection.Table_Adapter, data: *u8, count: s64
     return true;
 }
 
-finish_table_entries :: (table: Reflection.Table_Adapter, data: *u8) -> s64 {
+finish_table_entries :: (table: Reflection.Table_Adapter, data: *u8) -> bool, s64 {
     storage := table.access(data);
     count := storage.count.*;
     if count == 0 {
-        return -1;
+        return true, -1;
     }
+
     staging := storage.entries.*;
     // Detach the staging allocation before reset so it remains available on failure.
     storage.entries.* = .{};
     table.reset(data);
-    // One spare entry avoids growing at an exactly reached load threshold.
-    table.reserve(data, count + 1);
-    for index: 0..count - 1 {
-        entry := staging.data + index * table.entry_size;
-        key := entry + table.key_offset;
-        value := entry + table.value_offset;
-        if table.find(data, key) != null {
+    complete := false;
+    defer {
+        if !complete {
             table.reset(data);
             storage.entries.* = staging;
             storage.count.* = count;
             storage.allocated.* = count;
             storage.slots_filled.* = count;
-            return index;
+        }
+    }
+
+    if !table.try_reserve_empty(data, count) {
+        return false, -1;
+    }
+
+    for index: 0..count - 1 {
+        entry := staging.data + index * table.entry_size;
+        key := entry + table.key_offset;
+        value := entry + table.value_offset;
+        if table.find(data, key) != null {
+            return false, index;
         }
         table.insert(data, key, value);
     }
+
     free(staging.data,, storage.allocator.*);
-    return -1;
+    complete = true;
+    return true, -1;
 }
 
 visit_table_entry :: (state: *Serialize_State,
@@ -161,13 +179,16 @@ visit_table_entry :: (state: *Serialize_State,
     if state.path_count >= state.path.count {
         return serialize_error("Serialization path depth exceeded.", state);
     }
+
     path := *state.path[state.path_count];
     path.kind = .Element;
     path.index = index;
     state.path_count += 1;
     defer state.path_count -= 1;
+
     if !visit_field(state, "key", cast(*Type_Info)table.key_type, key, depth + 1) {
         return false;
     }
+
     return visit_field(state, "value", cast(*Type_Info)table.value_type, value, depth + 1);
 }

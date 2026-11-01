@@ -63,7 +63,7 @@ visit_array :: (state: *Serialize_State, info: *Type_Info_Array, data: *u8, dept
                 // Zero-size element types still need a usable storage pointer for callbacks.
                 elements = cast(*u8)alloc(ifx byte_count > 0 then byte_count else 1);
                 if elements == null {
-                    return serialize_error("Could not allocate array storage.", state);
+                    return serialize_allocation_error("MySerialize: could not allocate array storage.");
                 }
                 if byte_count > 0 {
                     memset(elements, 0, byte_count);
