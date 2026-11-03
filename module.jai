@@ -58,6 +58,7 @@
 // Custom codecs and assertion handlers remain responsible for their own allocation-failure behavior.
 
 #import "MyBasic";
+#import "MyBasic/MyName";
 
 #load "serialize_basic.jai";
 #load "serialize_block.jai";
