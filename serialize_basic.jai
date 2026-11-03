@@ -2,29 +2,29 @@
 
 visit_blob :: (state: *Serialize_State, info: *Type_Info, data: *u8) -> bool {
     reading := state.mode == .Validate || state.mode == .Read;
-    bytes: BinaryView;
+    bytes: BlobView;
     length: u64;
     if !reading {
         if info == type_info(string) {
             text := (cast(*string)data).*;
-            bytes = make_binary_view(text.data, text.count);
+            bytes = make_blob_view(text.data, text.count);
         }
         else if info == type_info(Name) {
             text := (cast(*Name)data).text;
-            bytes = make_binary_view(text.data, text.count);
+            bytes = make_blob_view(text.data, text.count);
         }
-        else if info == type_info(Binary) {
-            bytes = make_binary_view((cast(*Binary)data).*);
+        else if info == type_info(Blob) {
+            bytes = make_blob_view((cast(*Blob)data).*);
         }
-        else if info == type_info(BinaryView) {
-            bytes = (cast(*BinaryView)data).*;
+        else if info == type_info(BlobView) {
+            bytes = (cast(*BlobView)data).*;
         }
         else {
             return serialize_error("Unsupported blob type.", state);
         }
 
         if bytes.count < 0 || (bytes.count > 0 && bytes.data == null) {
-            return serialize_error("Invalid string or binary storage.", state);
+            return serialize_error("Invalid string or blob storage.", state);
         }
 
         length = cast(u64)bytes.count;
@@ -49,7 +49,7 @@ visit_blob :: (state: *Serialize_State, info: *Type_Info, data: *u8) -> bool {
         }
 
         if count > 0 {
-            bytes = make_binary_view(state.bytes.data + state.offset, count);
+            bytes = make_blob_view(state.bytes.data + state.offset, count);
         }
 
         if state.mode == .Read {
@@ -75,20 +75,20 @@ visit_blob :: (state: *Serialize_State, info: *Type_Info, data: *u8) -> bool {
                     (cast(*string)data).* = replacement;
                 }
             }
-            else if info == type_info(Binary) {
-                replacement, allocated := try_deep_copy_binary(bytes.data, bytes.count);
+            else if info == type_info(Blob) {
+                replacement, allocated := try_deep_copy_blob(bytes.data, bytes.count);
                 if !allocated {
-                    return serialize_allocation_error("MySerialize: could not allocate Binary storage.");
+                    return serialize_allocation_error("MySerialize: could not allocate Blob storage.");
                 }
-                clear_binary(cast(*Binary)data);
-                (cast(*Binary)data).* = replacement;
+                clear_blob(cast(*Blob)data);
+                (cast(*Blob)data).* = replacement;
             }
-            else if info == type_info(BinaryView) {
-                owned, allocated := try_deep_copy_binary(bytes.data, bytes.count);
+            else if info == type_info(BlobView) {
+                owned, allocated := try_deep_copy_blob(bytes.data, bytes.count);
                 if !allocated {
-                    return serialize_allocation_error("MySerialize: could not allocate BinaryView storage.");
+                    return serialize_allocation_error("MySerialize: could not allocate BlobView storage.");
                 }
-                (cast(*BinaryView)data).* = make_binary_view(owned);
+                (cast(*BlobView)data).* = make_blob_view(owned);
             }
             else {
                 return serialize_error("Unsupported blob destination.", state);
@@ -110,8 +110,8 @@ visit_value_body :: (state: *Serialize_State, info: *Type_Info, data: *u8, depth
 
     if (info == type_info(string) ||
         info == type_info(Name) ||
-        info == type_info(Binary) ||
-        info == type_info(BinaryView))
+        info == type_info(Blob) ||
+        info == type_info(BlobView))
     {
         return visit_blob(state, info, data);
     }
@@ -220,7 +220,7 @@ visit_custom :: (state: *Serialize_State, metadata: *Reflection.Struct_Metadata,
         return serialize_error("Custom payload exceeds the available buffer.", state);
     }
     if state.mode == .Write || state.mode == .Read {
-        payload := make_binary_view(state.bytes.data + state.offset, size);
+        payload := make_blob_view(state.bytes.data + state.offset, size);
         count: s64;
         if state.mode == .Write {
             count = metadata.custom_serialize(payload, data);

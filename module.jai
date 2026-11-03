@@ -18,11 +18,11 @@
  *
  * A struct T marked @CustomSerialize must declare three methods with these exact signatures:
  *   get_serialization_size :: (value: T) -> s64;
- *   serialize :: (destination: BinaryView, value: T) -> s64;
- *   deserialize :: (source: BinaryView, value: *T) -> s64;
+ *   serialize :: (destination: BlobView, value: T) -> s64;
+ *   deserialize :: (source: BlobView, value: *T) -> s64;
  *
  * - get_serialization_size returns the payload size only. It may run multiple times; keep the value and consulted external state stable.
- * - serialize writes directly into the supplied buffer and returns bytes written; it does not need to allocate a new Binary.
+ * - serialize writes directly into the supplied buffer and returns bytes written; it does not need to allocate a new Blob.
  * - deserialize restores value and returns bytes consumed. Check bounds and copy retained data:
  *   strings, views and other parts of the result must never reference source. Use make_name() to restore a Name.
  * - Return -1 on failure. MySerialize asserts on failure or when the returned byte count differs from the payload size.
@@ -33,7 +33,7 @@
  * Nested sizes already include their framing; do not add it manually. Passing the same T value back into these functions causes recursion.
  * For example, an Asset_Handle codec can serialize a path through these functions and resolve the restored path to a handle when reading.
  *
- * Call serialize(value) / deserialize(binary, T) externally, or serialize_into / deserialize_into for existing buffers.
+ * Call serialize(value) / deserialize(blob, T) externally, or serialize_into / deserialize_into for existing buffers.
  * Calling T.serialize / T.deserialize directly handles only the payload, without MySerialize's automatic prefix and checks.
  * The caller remains responsible for releasing custom resources on failure; see the TODO below.
  */
@@ -59,7 +59,6 @@
 // Custom codecs and assertion handlers remain responsible for their own allocation-failure behavior.
 
 #import "MyBasic";
-#import "MyBasic/MyName";
 
 #load "serialize_basic.jai";
 #load "serialize_block.jai";
@@ -84,8 +83,8 @@
  *   reading: Deserialize_Context;
  *   reading.allocator = context.allocator;
  *   reading.allocation_limit = 100 * 1024 * 1024;
- *   value, ok := deserialize(binary, My_Type, *reading);
- * Free strings and views with the selected allocator. Binary, resizable arrays and tables remember it themselves.
+ *   value, ok := deserialize(blob, My_Type, *reading);
+ * Free strings and views with the selected allocator. Blob, resizable arrays and tables remember it themselves.
  */
 Deserialize_Context :: struct {
     allocator: Allocator;
@@ -110,21 +109,21 @@ get_serialization_size :: (value: $T) -> s64 {
 /**
  * @brief Allocates one output buffer and serializes selected reflected fields into it.
  * @param[in] value Source value, unchanged between size calculation and writing.
- * @return Owned buffer and success flag. Release the buffer with clear_binary.
+ * @return Owned buffer and success flag. Release the buffer with clear_blob.
  * @note Custom size and write methods must avoid temporary allocations to preserve the one-allocation contract.
  */
-serialize :: (value: $T) -> Binary, bool {
+serialize :: (value: $T) -> Blob, bool {
     size := get_serialization_size(value);
     if size < 0 {
         return .{}, false;
     }
-    output, allocated := try_make_binary(size);
+    output, allocated := try_make_blob(size);
     if !allocated {
-        serialize_allocation_error("MySerialize: could not allocate the output Binary.");
+        serialize_allocation_error("MySerialize: could not allocate the output Blob.");
         return .{}, false;
     }
-    if write_value(make_binary_view(output), type_info(T), cast(*u8)*value, size) < 0 {
-        clear_binary(*output);
+    if write_value(make_blob_view(output), type_info(T), cast(*u8)*value, size) < 0 {
+        clear_blob(*output);
         return .{}, false;
     }
     return output, true;
@@ -136,7 +135,7 @@ serialize :: (value: $T) -> Binary, bool {
  * @param[in] value Source value, unchanged during size calculation and writing.
  * @return Bytes written, or -1 after an assertion on failure. Unused trailing storage is untouched.
  */
-serialize_into :: (destination: BinaryView, value: $T) -> s64 {
+serialize_into :: (destination: BlobView, value: $T) -> s64 {
     size := get_serialization_size(value);
     if size < 0 {
         return -1;
@@ -145,23 +144,23 @@ serialize_into :: (destination: BinaryView, value: $T) -> s64 {
 }
 
 /**
- * @brief Reads an entire binary into a value initialized with its declared defaults.
- * @param[in] binary Input storage; decoded results must never retain its bytes.
+ * @brief Reads an entire blob into a value initialized with its declared defaults.
+ * @param[in] blob Input storage; decoded results must never retain its bytes.
  * @param[in] T Result type.
  * @param[in,out] read_context Allocation policy and statistics; null inherits the active operation or uses default policy.
  * @return Value and success flag. Custom-codec failure may leave a partially decoded value requiring cleanup.
  * @details
- * - Strings and BinaryViews own copies: free their data in the decoding allocator context.
- * - Binary fields own copies released with clear_binary. Names are interned and must not be freed.
+ * - Strings and BlobViews own copies: free their data in the decoding allocator context.
+ * - Blob fields own copies released with clear_blob. Names are interned and must not be freed.
  * - Arrays own independent element storage. Release nested resources before freeing the array itself.
  * - Tables and sets own their entries and decoded keys/values. Release nested resources before deinit.
  * - Pass a Deserialize_Context to select the allocator and optional byte budget; no fixed element-count limit is imposed.
  * - Table/set keys must preserve equality/hash semantics across serialization. Duplicate decoded keys are rejected.
  * - On failure, tables/sets may contain staging entries: only iterate for resource cleanup and deinit; do not perform lookups or inserts.
  */
-deserialize :: (binary: Binary, $T: Type, read_context: *Deserialize_Context = null) -> T, bool {
+deserialize :: (blob: Blob, $T: Type, read_context: *Deserialize_Context = null) -> T, bool {
     value: T;
-    count := deserialize_into(binary, *value, read_context);
+    count := deserialize_into(blob, *value, read_context);
     return value, count >= 0;
 }
 
@@ -175,17 +174,17 @@ deserialize :: (binary: Binary, $T: Type, read_context: *Deserialize_Context = n
  * @pre Dynamic array destinations must have zero count and null data (no reserved storage).
  * @pre Hash-table and hash-set destinations must be empty with no reserved storage; the operation selects their allocator.
  * @note On a custom-codec failure, allocated arrays remain attached to the partial result for caller cleanup.
- * @pre Input must not overlap the destination or its owned allocations. Binary fields must be valid or empty.
+ * @pre Input must not overlap the destination or its owned allocations. Blob fields must be valid or empty.
  * @note Release previously owned strings/views before replacement; their prior storage may be borrowed or literal.
  * @note Custom codecs must check bounds before access and copy retained data. Their failure may leave earlier fields updated.
  */
-deserialize_into :: (source: BinaryView, value: *$T, read_context: *Deserialize_Context = null) -> s64 {
+deserialize_into :: (source: BlobView, value: *$T, read_context: *Deserialize_Context = null) -> s64 {
     return read_value(source, type_info(T), cast(*u8)value, false, read_context);
 }
 
-// An owning Binary represents one complete message; reject trailing bytes before updating the destination.
-deserialize_into :: (binary: Binary, value: *$T, read_context: *Deserialize_Context = null) -> s64 {
-    return read_value(make_binary_view(binary), type_info(T), cast(*u8)value, true, read_context);
+// An owning Blob represents one complete message; reject trailing bytes before updating the destination.
+deserialize_into :: (blob: Blob, value: *$T, read_context: *Deserialize_Context = null) -> s64 {
+    return read_value(make_blob_view(blob), type_info(T), cast(*u8)value, true, read_context);
 }
 
 #scope_module
@@ -209,7 +208,7 @@ Serialization_Path :: struct {
 
 Serialize_State :: struct {
     mode: Serialize_Mode;
-    bytes: BinaryView;
+    bytes: BlobView;
     offset: s64;
     read_context: *Deserialize_Context;
     path_count: int;
@@ -296,14 +295,14 @@ transfer_bytes :: (state: *Serialize_State, data: *u8, count: s64) -> bool {
     return true;
 }
 
-valid_buffer :: (bytes: BinaryView) -> bool {
+valid_buffer :: (bytes: BlobView) -> bool {
     if bytes.count < 0 || (bytes.count > 0 && bytes.data == null) {
-        return serialize_error("Invalid binary storage.");
+        return serialize_error("Invalid blob storage.");
     }
     return true;
 }
 
-write_value :: (destination: BinaryView, info: *Type_Info, data: *u8, expected: s64) -> s64 {
+write_value :: (destination: BlobView, info: *Type_Info, data: *u8, expected: s64) -> s64 {
     if !valid_buffer(destination) {
         return -1;
     }
@@ -313,7 +312,7 @@ write_value :: (destination: BinaryView, info: *Type_Info, data: *u8, expected: 
     }
     state: Serialize_State;
     state.mode = .Write;
-    state.bytes = make_binary_view(destination.data, expected);
+    state.bytes = make_blob_view(destination.data, expected);
     if !visit_value(*state, info, data, 0) {
         return -1;
     }
@@ -324,7 +323,7 @@ write_value :: (destination: BinaryView, info: *Type_Info, data: *u8, expected: 
     return state.offset;
 }
 
-read_value :: (source: BinaryView, info: *Type_Info, data: *u8, require_complete: bool, requested: *Deserialize_Context) -> s64 {
+read_value :: (source: BlobView, info: *Type_Info, data: *u8, require_complete: bool, requested: *Deserialize_Context) -> s64 {
     local_settings: Deserialize_Context;
     settings := requested;
     active := context.myserialize_read_operation;

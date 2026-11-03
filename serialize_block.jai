@@ -2,7 +2,7 @@
 
 visit_value :: (state: *Serialize_State, info: *Type_Info, data: *u8, depth: int) -> bool {
     framed := info.type == .ARRAY || info.type == .STRUCT;
-    if info == type_info(Name) || info == type_info(Binary) || info == type_info(BinaryView) {
+    if info == type_info(Name) || info == type_info(Blob) || info == type_info(BlobView) {
         framed = false;
     }
     else if info.type == .STRUCT {
