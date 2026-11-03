@@ -161,8 +161,8 @@ visit_value_body :: (state: *Serialize_State, info: *Type_Info, data: *u8, depth
         if metadata.custom_serialization {
             return visit_custom(state, metadata, data, depth);
         }
-        if metadata.is_hash_table {
-            return visit_hash_table(state, metadata.table_adapter, data, depth);
+        if metadata.is_hash_table || metadata.is_hash_set {
+            return visit_hash_collection(state, metadata.table_adapter, data, depth);
         }
         structure := cast(*Type_Info_Struct)info;
         if structure.textual_flags & .UNION_IS_TAGGED {

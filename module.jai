@@ -39,7 +39,8 @@
  */
 
 // Format: selected fields in declaration order, native scalars, u64 byte lengths and collection element counts.
-// Hash tables store key/value pairs in iteration order; hashes, capacity and tombstones are rebuilt on read.
+// Hash tables store key/value pairs; HashSet stores only keys, with the same framing/count layout as an array.
+// Iteration order is unspecified. Hashes, capacity and tombstones are rebuilt on read; duplicate keys are rejected.
 // Composite values have a u64 payload-byte-length prefix, excluding the prefix itself.
 // This format is incompatible with the older unframed struct/array format.
 // No padding, field names, schema version or endian conversion is stored.
@@ -50,7 +51,7 @@
 //
 // TODO: Define a cleanup contract for custom deserialized values before making table reads transactional.
 // A custom codec can create owned resources, including before returning an error; reflection cannot infer how to release them.
-// For now, failed table reads retain staging entries in the destination so callers can clean up partial keys/values.
+// For now, failed table/set reads retain staging entries in the destination so callers can clean up partial keys/values.
 // Such a table supports cleanup iteration and deinit only: its hash index may be unfinished, so do not look up or insert keys.
 // The caller must handle partially decoded custom values and release their resources; automatic rollback is not provided.
 // Built-in allocation failures assert without allocating diagnostic text, then return false/-1 if the handler continues.
@@ -64,7 +65,7 @@
 #load "serialize_block.jai";
 #load "serialize_union.jai";
 #load "serialize_array.jai";
-#load "serialize_hash_table.jai";
+#load "serialize_hash_collection.jai";
 #load "serialize_enum.jai";
 #load "serialize_type.jai";
 
@@ -153,10 +154,10 @@ serialize_into :: (destination: BinaryView, value: $T) -> s64 {
  * - Strings and BinaryViews own copies: free their data in the decoding allocator context.
  * - Binary fields own copies released with clear_binary. Names are interned and must not be freed.
  * - Arrays own independent element storage. Release nested resources before freeing the array itself.
- * - Tables own their entries and decoded keys/values. Release nested resources before deinit.
+ * - Tables and sets own their entries and decoded keys/values. Release nested resources before deinit.
  * - Pass a Deserialize_Context to select the allocator and optional byte budget; no fixed element-count limit is imposed.
- * - Table keys must preserve equality/hash semantics across serialization. Duplicate decoded keys are rejected.
- * - On failure, tables may contain staging entries: only iterate for resource cleanup and deinit; do not perform lookups or inserts.
+ * - Table/set keys must preserve equality/hash semantics across serialization. Duplicate decoded keys are rejected.
+ * - On failure, tables/sets may contain staging entries: only iterate for resource cleanup and deinit; do not perform lookups or inserts.
  */
 deserialize :: (binary: Binary, $T: Type, read_context: *Deserialize_Context = null) -> T, bool {
     value: T;
@@ -172,7 +173,7 @@ deserialize :: (binary: Binary, $T: Type, read_context: *Deserialize_Context = n
  * @return Bytes consumed, or -1 after an assertion on failure. Trailing bytes may belong to the next value.
  * @pre Release resources of an existing tagged-union variant before replacing it.
  * @pre Dynamic array destinations must have zero count and null data (no reserved storage).
- * @pre Hash-table destinations must be empty with no reserved storage; the operation selects their allocator.
+ * @pre Hash-table and hash-set destinations must be empty with no reserved storage; the operation selects their allocator.
  * @note On a custom-codec failure, allocated arrays remain attached to the partial result for caller cleanup.
  * @pre Input must not overlap the destination or its owned allocations. Binary fields must be valid or empty.
  * @note Release previously owned strings/views before replacement; their prior storage may be borrowed or literal.
